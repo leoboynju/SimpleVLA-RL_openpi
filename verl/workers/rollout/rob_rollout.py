@@ -454,7 +454,19 @@ class RobHFRollout(BaseRollout):
             "robotwin2_place_shoe": 250,
             "robotwin2_move_pillbottle_pad": 200,
         }
-        self.processor = AutoProcessor.from_pretrained(config.pretrained_checkpoint, trust_remote_code=True)
+        
+        # Only load processor for OpenVLA models, not OpenPI
+        if config.vla not in ["pi_0", "pi_05"]:
+            try:
+                self.processor = AutoProcessor.from_pretrained(config.pretrained_checkpoint, trust_remote_code=True)
+            except Exception as e:
+                # If it's not a HF model, create a minimal processor
+                print(f"Warning: Could not load processor for {config.vla}: {e}")
+                self.processor = None
+        else:
+            # For OpenPI models, we'll create a minimal processor-like interface
+            self.processor = None
+            
         self.vla_preprocess()
         
         # Setup execution pool based on task suite
@@ -486,6 +498,11 @@ class RobHFRollout(BaseRollout):
             elif "robotwin" in self.config.task_suite_name:
                 self.config.unnorm_key = self.config.unnorm_key.removeprefix("robotwin_").removeprefix("robotwin2_")
             assert self.config.unnorm_key in self.module.norm_stats, f"Action un-norm key {self.config.unnorm_key} not found in VLA `norm_stats`!"
+        
+        elif self.config.vla in ["pi_0", "pi_05"]:
+            # OpenPI models use their own normalization system
+            print(f"Using OpenPI model: {self.config.vla}")
+            # OpenPI normalization is handled internally by the policy
 
     def generate_sequences(self, prompts):
         batch_size = prompts.batch.batch_size[0]
@@ -502,73 +519,143 @@ class RobHFRollout(BaseRollout):
         return output
     
     def process_input(self, inputs: list, task_descriptions: list):
-        """Unified input processing for both Robotwin and Libero"""
+        """Unified input processing for both Robotwin and Libero
+        
+        Key differences between OpenVLA and OpenPI:
+        - OpenVLA: Uses tokenized prompts (input_ids) with HuggingFace processor
+        - OpenPI: Uses raw task description strings directly, custom image processing
+        """
         batchdata = {"input_ids": [], "attention_mask": [], "pixel_values": []}
         if self.config.use_proprio and "robotwin" in self.config.task_suite_name:
             batchdata["proprio"] = []
+        
+        # OpenPI specific data - uses task_descriptions directly (not tokenized)
+        if self.config.vla in ["pi_0", "pi_05"]:
+            batchdata["wrist_pixel_values"] = []
+            batchdata["state"] = []
+            batchdata["task_descriptions"] = []  # Raw strings, not tokenized!
         
         for i in range(len(inputs)):
             input_data = inputs[i]
             task_description = task_descriptions[i]
             
-            # Process main image
-            image = Image.fromarray(input_data["full_image"]).convert("RGB")
-            if self.config.center_crop:
-                image = center_crop_image(image)
-            prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
-            batch_feature = self.processor(prompt, image)
-            
-            pixel_values_list = [batch_feature["pixel_values"]]
-            
-            # Process additional images (wrist cameras)
-            if "robotwin" in self.config.task_suite_name:
-                # Robotwin may have multiple wrist images
-                for key in input_data:
-                    if "wrist" in key and isinstance(input_data[key], np.ndarray):
-                        wrist_image = Image.fromarray(input_data[key]).convert("RGB")
+            # OpenPI uses different input processing - raw strings + custom image format
+            if self.config.vla in ["pi_0", "pi_05"]:
+                # OpenPI image dimensions: typically 224x224 or 256x256, 3 channels
+                image = Image.fromarray(input_data["full_image"]).convert("RGB")
+                
+                # Resize to OpenPI expected size (usually 224x224)
+                target_size = getattr(self.config, 'image_size', 224)
+                if image.size != (target_size, target_size):
+                    image = image.resize((target_size, target_size), Image.BILINEAR)
+                
+                if self.config.center_crop:
+                    image = center_crop_image(image)
+                
+                # Convert to tensor: [C, H, W] format for OpenPI
+                image_np = np.array(image)
+                # Normalize to [0, 1] if needed, then convert to tensor
+                image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float()  # [C, H, W]
+                # Add batch dimension
+                image_tensor = image_tensor.unsqueeze(0)  # [1, C, H, W]
+                
+                # Wrist image (optional)
+                if "wrist_image" in input_data:
+                    wrist_image = Image.fromarray(input_data["wrist_image"]).convert("RGB")
+                    if wrist_image.size != (target_size, target_size):
+                        wrist_image = wrist_image.resize((target_size, target_size), Image.BILINEAR)
+                    if self.config.center_crop:
+                        wrist_image = center_crop_image(wrist_image)
+                    wrist_image_np = np.array(wrist_image)
+                    wrist_tensor = torch.from_numpy(wrist_image_np).permute(2, 0, 1).float().unsqueeze(0)
+                else:
+                    wrist_tensor = torch.zeros(1, 3, target_size, target_size)
+                
+                # State (proprioception) - OpenPI expects normalized state
+                if "state" in input_data:
+                    state = torch.from_numpy(input_data["state"]).float().unsqueeze(0)
+                else:
+                    # Default state dimension for most robot envs
+                    state_dim = getattr(self.config, 'state_dim', 14)  # 7 DOF arm + gripper
+                    state = torch.zeros(1, state_dim)
+                
+                batchdata["pixel_values"].append(image_tensor)
+                batchdata["wrist_pixel_values"].append(wrist_tensor)
+                batchdata["state"].append(state)
+                
+                # CRITICAL: OpenPI uses raw task description strings, NOT tokenized prompts
+                # This is the key difference from OpenVLA!
+                batchdata["task_descriptions"].append(task_description)
+                
+                # Dummy input_ids and attention_mask (not used by OpenPI but kept for interface compatibility)
+                dummy_ids = torch.zeros(1, 1).long()
+                batchdata["input_ids"].append(dummy_ids)
+                batchdata["attention_mask"].append(torch.ones_like(dummy_ids).bool())
+                
+            else:
+                # Original processing for OpenVLA models (tokenized prompts)
+                image = Image.fromarray(input_data["full_image"]).convert("RGB")
+                if self.config.center_crop:
+                    image = center_crop_image(image)
+                prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
+                batch_feature = self.processor(prompt, image)
+                
+                pixel_values_list = [batch_feature["pixel_values"]]
+                
+                # Process additional images (wrist cameras)
+                if "robotwin" in self.config.task_suite_name:
+                    for key in input_data:
+                        if "wrist" in key and isinstance(input_data[key], np.ndarray):
+                            wrist_image = Image.fromarray(input_data[key]).convert("RGB")
+                            if self.config.center_crop:
+                                wrist_image = center_crop_image(wrist_image)
+                            wrist_batch_feature = self.processor(prompt, wrist_image)
+                            pixel_values_list.append(wrist_batch_feature["pixel_values"])
+                else:
+                    if "wrist_image" in input_data:
+                        wrist_image = Image.fromarray(input_data["wrist_image"]).convert("RGB")
                         if self.config.center_crop:
                             wrist_image = center_crop_image(wrist_image)
                         wrist_batch_feature = self.processor(prompt, wrist_image)
                         pixel_values_list.append(wrist_batch_feature["pixel_values"])
-            else:
-                # Libero has single wrist image
-                if "wrist_image" in input_data:
-                    wrist_image = Image.fromarray(input_data["wrist_image"]).convert("RGB")
-                    if self.config.center_crop:
-                        wrist_image = center_crop_image(wrist_image)
-                    wrist_batch_feature = self.processor(prompt, wrist_image)
-                    pixel_values_list.append(wrist_batch_feature["pixel_values"])
-            
-            batch_feature["pixel_values"] = torch.cat(pixel_values_list, dim=1)
-            
-            input_ids = batch_feature["input_ids"]
-            attention_mask = batch_feature["attention_mask"]
-            pixel_values = batch_feature["pixel_values"]
-            
-            if not torch.all(input_ids[:, -1] == 29871):
-                input_ids = torch.cat(
-                    (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
-                )
-                if self.config.vla in ["openvla-oft"]:
-                    attention_mask = torch.cat(
-                        (attention_mask, torch.unsqueeze(torch.Tensor([True]).bool(), dim=0).to(attention_mask.device)), dim=1
+                
+                batch_feature["pixel_values"] = torch.cat(pixel_values_list, dim=1)
+                
+                input_ids = batch_feature["input_ids"]
+                attention_mask = batch_feature["attention_mask"]
+                pixel_values = batch_feature["pixel_values"]
+                
+                if not torch.all(input_ids[:, -1] == 29871):
+                    input_ids = torch.cat(
+                        (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
                     )
-            
-            batchdata["input_ids"].append(input_ids)
-            batchdata["attention_mask"].append(attention_mask)
-            batchdata["pixel_values"].append(pixel_values)
-            
-            # Process proprioception for Robotwin
-            if self.config.use_proprio and "robotwin" in self.config.task_suite_name:
-                proprio = input_data["state"]
-                proprio_norm_stats = self.module.norm_stats[self.config.unnorm_key]["proprio"]
-                proprio = normalize_proprio(proprio, proprio_norm_stats)
-                batchdata["proprio"].append(torch.from_numpy(proprio))
+                    if self.config.vla in ["openvla-oft"]:
+                        attention_mask = torch.cat(
+                            (attention_mask, torch.unsqueeze(torch.Tensor([True]).bool(), dim=0).to(attention_mask.device)), dim=1
+                        )
+                
+                batchdata["input_ids"].append(input_ids)
+                batchdata["attention_mask"].append(attention_mask)
+                batchdata["pixel_values"].append(pixel_values)
+                
+                if self.config.use_proprio and "robotwin" in self.config.task_suite_name:
+                    proprio = input_data["state"]
+                    proprio_norm_stats = self.module.norm_stats[self.config.unnorm_key]["proprio"]
+                    proprio = normalize_proprio(proprio, proprio_norm_stats)
+                    batchdata["proprio"].append(torch.from_numpy(proprio))
         
         device = torch.device('cuda')
         
         # Padding and device placement
-        if self.config.vla in ["openvla-oft"]:
+        if self.config.vla in ["pi_0", "pi_05"]:
+            # OpenPI: concatenate tensors, keep task_descriptions as list of strings
+            batchdata["pixel_values"] = torch.cat(batchdata["pixel_values"], dim=0).to(device)
+            batchdata["wrist_pixel_values"] = torch.cat(batchdata["wrist_pixel_values"], dim=0).to(device)
+            batchdata["state"] = torch.cat(batchdata["state"], dim=0).to(device)
+            batchdata["input_ids"] = torch.cat(batchdata["input_ids"], dim=0).to(device)
+            batchdata["attention_mask"] = torch.cat(batchdata["attention_mask"], dim=0).to(device)
+            # task_descriptions stays as list of strings for the model to process
+        elif self.config.vla in ["openvla-oft"]:
             batchdata["input_ids"] = [x.transpose(0, 1) for x in batchdata["input_ids"]]
             batchdata["attention_mask"] = [x.transpose(0, 1) for x in batchdata["attention_mask"]]
             batchdata["input_ids"] = pad_sequence(batchdata["input_ids"], batch_first=True, padding_value=self.processor.tokenizer.pad_token_id).squeeze(-1).to(device)
@@ -919,6 +1006,8 @@ class RobHFRollout(BaseRollout):
             return self._generate_one_step_oft(prompts)
         elif self.config.vla == "openvla":
             return self._generate_one_step_openvla(prompts)
+        elif self.config.vla in ["pi_0", "pi_05"]:
+            return self._generate_one_step_openpi(prompts)
         else:
             raise ValueError(f"Unknown VLA type: {self.config.vla}")
     
@@ -1079,6 +1168,99 @@ class RobHFRollout(BaseRollout):
             "pixel_values": pixel_values,
             "action": actions,
         }
+        
+        return batch
+    
+    def _generate_one_step_openpi(self, prompts: dict):
+        """Generate one step for OpenPI (π₀ or π₀.₅)
+        
+        OpenPI uses a Gaussian policy (continuous actions) instead of discrete tokens.
+        The model is wrapped with OpenPIPPOWrapper which provides:
+        - action_means: Predicted mean of actions [B, horizon, action_dim]
+        - action_stds: Predicted std of actions [B, horizon, action_dim]
+        - actions: Sampled actions for environment interaction
+        """
+        pixel_values = prompts["pixel_values"]
+        wrist_pixel_values = prompts.get("wrist_pixel_values", None)
+        state = prompts.get("state", None)
+        task_descriptions = prompts.get("task_descriptions", [])
+        input_ids = prompts["input_ids"]
+        attention_mask = prompts["attention_mask"]
+        
+        batch_size = pixel_values.size(0)
+        param_ctx = contextlib.nullcontext()
+        
+        # Get action dimensions from config
+        action_horizon = getattr(self.config, 'action_chunks_len', 8)
+        action_dim = getattr(self.config, 'action_token_len', 7)
+        
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+        
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # Call OpenPI model through the wrapper
+                # The wrapper handles the diffusion process and returns Gaussian policy params
+                output = self.module(
+                    pixel_values=pixel_values,
+                    wrist_pixel_values=wrist_pixel_values,
+                    state=state,
+                    task_descriptions=task_descriptions,
+                    return_dict=True,
+                )
+        
+        # Extract outputs from wrapper
+        # The wrapper returns action_means and action_stds for PPO training
+        action_means = output["action_means"]  # [B, action_horizon, action_dim]
+        action_stds = output["action_stds"]  # [B, action_horizon, action_dim]
+        
+        # Sample actions for environment interaction (stochastic for exploration)
+        deterministic = prompts.get('deterministic', getattr(self.config, 'do_sample', False))
+        if deterministic:
+            # Use mean for deterministic evaluation
+            actions = action_means
+        else:
+            # Sample from Normal(mean, std) for exploration during rollout
+            dist = torch.distributions.Normal(action_means, action_stds + 1e-8)
+            actions = dist.rsample()  # [B, action_horizon, action_dim]
+        
+        # Convert to numpy for environment
+        actions_np = actions.detach().cpu().numpy()
+        
+        # For PPO training compatibility, flatten action_means to [B, horizon*dim]
+        response = action_means.reshape(batch_size, action_horizon * action_dim)
+        
+        # Pad input_ids and attention_mask to max_prompt_length
+        if hasattr(self.config, 'max_prompt_length'):
+            input_ids = verl_F.pad_sequence_to_length(
+                input_ids,
+                max_seq_len=self.config.max_prompt_length,
+                pad_token_id=0,
+                left_pad=True
+            )
+            attention_mask = verl_F.pad_sequence_to_length(
+                attention_mask,
+                max_seq_len=self.config.max_prompt_length,
+                pad_token_id=0,
+                left_pad=True
+            )
+        
+        batch = {
+            'responses': response,  # Action means for PPO log_prob computation
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            "pixel_values": pixel_values,
+            "action": actions_np,  # Sampled actions for environment
+        }
+        
+        # Include additional info for PPO training
+        batch["action_means"] = action_means
+        batch["action_stds"] = action_stds
+        
+        if wrist_pixel_values is not None:
+            batch["wrist_pixel_values"] = wrist_pixel_values
+        if state is not None:
+            batch["state"] = state
         
         return batch
     

@@ -44,6 +44,7 @@ from codetiming import Timer
 from verl.utils.openvla_utils import update_auto_map , check_model_logic_mismatch
 from peft import LoraConfig, PeftModel, get_peft_model, TaskType
 import json
+import sys
 
 
 logger = logging.getLogger(__file__)
@@ -153,6 +154,13 @@ class RobActorRolloutRefWorker(Worker):
                 check_model_logic_mismatch(local_path)
             torch.distributed.barrier()
         
+        elif self.config.model.vla in ["pi_0", "pi_05"]:
+            # OpenPI models (π₀ or π₀.₅)
+            from verl.utils.vla_utils.openpi import create_openpi_model, OpenPIPPOWrapper
+            if self.rank == 0:
+                print(f"Loading OpenPI model: {self.config.model.vla}")
+            torch.distributed.barrier()
+        
         #add end
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
@@ -166,26 +174,39 @@ class RobActorRolloutRefWorker(Worker):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-        if self.config.model.use_remove_padding:
-            from verl.models.registry import check_model_support_rmpad
-            check_model_support_rmpad(actor_model_config.model_type)
-        override_config_kwargs = {
-            'bos_token_id': self.tokenizer.bos_token_id,
-            'eos_token_id': self.tokenizer.eos_token_id,
-            'pad_token_id': self.tokenizer.pad_token_id,
-        }
-        if self.config.rollout.use_proprio:
-            override_config_kwargs["use_proprio"] = True
-            override_config_kwargs["proprio_dim"] = self.config.model.action_token_len
+        # For OpenPI models, skip AutoConfig loading as they don't use HuggingFace config
+        if self.config.model.vla in ["pi_0", "pi_05"]:
+            # Create a minimal config object for OpenPI
+            from types import SimpleNamespace
+            actor_model_config = SimpleNamespace(
+                tie_word_embeddings=False,
+                model_type="openpi",
+                use_remove_padding=False
+            )
+            # Skip config override for OpenPI as it uses its own config system
+            if self.rank == 0:
+                print(f'Using OpenPI model config (model_type: {actor_model_config.model_type})')
         else:
-            override_config_kwargs["use_proprio"] = False
-            override_config_kwargs["proprio_dim"] = self.config.model.action_token_len
+            actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+            if self.config.model.use_remove_padding:
+                from verl.models.registry import check_model_support_rmpad
+                check_model_support_rmpad(actor_model_config.model_type)
+            override_config_kwargs = {
+                'bos_token_id': self.tokenizer.bos_token_id,
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'pad_token_id': self.tokenizer.pad_token_id,
+            }
+            if self.config.rollout.use_proprio:
+                override_config_kwargs["use_proprio"] = True
+                override_config_kwargs["proprio_dim"] = self.config.model.action_token_len
+            else:
+                override_config_kwargs["use_proprio"] = False
+                override_config_kwargs["proprio_dim"] = self.config.model.action_token_len
 
-        override_config_kwargs.update(override_model_config)
-        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
-        if self.rank == 0:
-            print(f'Model config after override: {actor_model_config}')
+            override_config_kwargs.update(override_model_config)
+            update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+            if self.rank == 0:
+                print(f'Model config after override: {actor_model_config}')
 
         
         init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings)
@@ -226,8 +247,221 @@ class RobActorRolloutRefWorker(Worker):
                                                     config=actor_model_config,              
                                                     trust_remote_code=True,
                                                 )
-           
-            actor_module.to(torch_dtype)
+            
+            elif self.config.model.vla in ["pi_0", "pi_05"]:
+                # Enhanced OpenPI model loading with fallback strategy
+                use_wrapper = True  # Default to using wrapper for compatibility
+                
+                try:
+                    # First, try to load the model directly for better performance
+                    if self.rank == 0:
+                        print(f"="*80)
+                        print(f"Attempting to load OpenPI model directly: {self.config.model.vla}")
+                    
+                    # Get model parameters
+                    action_dim = self.config.model.get('action_token_len', 7)
+                    action_horizon = self.config.model.get('action_chunks_len', 8)
+                    pi05 = (self.config.model.vla == "pi_05")
+                    
+                    # Determine model variants
+                    paligemma_variant = "gemma_2b"
+                    action_expert_variant = "gemma_300m"
+                    
+                    # Try to import and create the model directly
+                    try:
+                        import sys
+                        sys.path.insert(0, "/data/zhengshenli/leo/embodied_ai/openpi/src")
+                        
+                        # Import required modules
+                        from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+                        from openpi.models.pi0_config import Pi0Config
+                        from openpi.shared.normalize import load as load_norm_stats
+                        import safetensors.torch
+                        
+                        # Create model config
+                        config = Pi0Config(
+                            pi05=pi05,
+                            action_dim=action_dim,
+                            action_horizon=action_horizon,
+                            max_token_len=200 if pi05 else 48,
+                            dtype="bfloat16",
+                            paligemma_variant=paligemma_variant,
+                            action_expert_variant=action_expert_variant
+                        )
+                        
+                        # Create the model directly
+                        openpi_model = PI0Pytorch(config)
+                        
+                        # Load weights using safetensors (similar to PyTorch training script)
+                        model_path = os.path.join(local_path, "model.safetensors")
+                        if os.path.exists(model_path):
+                            safetensors.torch.load_model(openpi_model, model_path, device='cpu')
+                            if self.rank == 0:
+                                print(f"✓ Loaded OpenPI model directly from {model_path}")
+                        else:
+                            raise FileNotFoundError(f"No model weights found at {model_path}")
+                        
+                        # Load normalization stats
+                        task_suite = self.config.rollout.get('task_suite_name', 'libero_10')
+                        norm_stats_path = os.path.join(local_path, "assets", task_suite)
+                        if os.path.exists(norm_stats_path):
+                            try:
+                                norm_stats = load_norm_stats(norm_stats_path)
+                                openpi_model.norm_stats = norm_stats
+                                if self.rank == 0:
+                                    print(f"✓ Loaded norm stats from {norm_stats_path}")
+                            except Exception as e:
+                                if self.rank == 0:
+                                    print(f"Warning: Failed to load norm stats: {e}")
+                        
+                        # Success! Use the direct model
+                        actor_module = openpi_model
+                        use_wrapper = False
+                        
+                        if self.rank == 0:
+                            print(f"✓ Successfully loaded OpenPI model directly")
+                            print(f"  - Action dim: {action_dim}")
+                            print(f"  - Action horizon: {action_horizon}")
+                            print(f"  - Model type: {self.config.model.vla}")
+                            print(f"  - PI05: {pi05}")
+                            print(f"="*80)
+                        
+                    except Exception as e:
+                        if self.rank == 0:
+                            print(f"Direct loading failed: {e}")
+                            print("Falling back to wrapper-based loading...")
+                        use_wrapper = True
+                
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"Error in direct loading attempt: {e}")
+                        print("Falling back to wrapper-based loading...")
+                    use_wrapper = True
+                
+                # If direct loading failed or is disabled, use the wrapper
+                if use_wrapper:
+                    from verl.utils.vla_utils.openpi import create_pi0_rl_model, PYTORCH_RL_AVAILABLE, OpenPIPPOWrapper
+                    
+                    if not PYTORCH_RL_AVAILABLE:
+                        raise RuntimeError(
+                            "Official PyTorch OpenPI wrapper not available. "
+                            "Please ensure OpenPI source code is accessible at /data/zhengshenli/leo/embodied_ai/openpi/src"
+                        )
+                    
+                    # Determine config name based on model version and task
+                    task_suite = self.config.rollout.get('task_suite_name', 'libero_10')
+                    
+                    if self.config.model.vla == "pi_05":
+                        # π₀.₅ 模型配置
+                        if "libero" in task_suite:
+                            config_name = "pi05_libero"
+                        elif "aloha" in task_suite:
+                            config_name = "pi05_aloha_sim"
+                        elif "droid" in task_suite:
+                            config_name = "pi05_droid"
+                        else:
+                            config_name = "pi05_libero"  # 默认
+                    else:
+                        # π₀ 模型配置
+                        if "libero" in task_suite:
+                            config_name = "pi0_libero"
+                        elif "aloha" in task_suite:
+                            config_name = "pi0_aloha_sim"
+                        elif "droid" in task_suite:
+                            config_name = "pi0_droid"
+                        else:
+                            config_name = "pi0_libero"  # 默认
+                    
+                    if self.rank == 0:
+                        print(f"Using wrapper-based loading for: {self.config.model.vla}")
+                        print(f"Config: {config_name}")
+                        print(f"Task suite: {task_suite}")
+                    
+                    # Get action parameters
+                    action_dim = self.config.model.get('action_token_len', 7)
+                    action_horizon = self.config.model.get('action_chunks_len', 8)
+                    
+                    # Create PyTorch-native OpenPI model with RL wrapper
+                    openpi_model = create_pi0_rl_model(
+                        model_path=local_path,
+                        config_name=config_name,
+                        action_dim=action_dim,
+                        action_horizon=action_horizon,
+                        device='cuda' if torch.cuda.is_available() else 'cpu',
+                    )
+                    
+                    # Load normalization stats
+                    norm_stats_path = os.path.join(local_path, "assets", task_suite)
+                    if os.path.exists(norm_stats_path):
+                        import glob
+                        norm_files = glob.glob(os.path.join(norm_stats_path, "**/norm_stats.*"), recursive=True)
+                        if norm_files:
+                            try:
+                                # Load norm stats (OpenPI format)
+                                import openpi.shared.normalize as _normalize
+                                norm_stats = _normalize.load(norm_stats_path)
+                                openpi_model.norm_stats = norm_stats
+                                if self.rank == 0:
+                                    print(f"✓ Loaded norm stats from {norm_stats_path}")
+                            except Exception as e:
+                                if self.rank == 0:
+                                    print(f"Warning: Failed to load norm stats: {e}")
+                    
+                    # Wrap OpenPI model with compatible wrapper for PPO training
+                    action_std_init = self.config.model.get('action_std_init', 0.1)
+                    learn_std = self.config.model.get('learn_action_std', True)
+                    use_tanh = self.config.model.get('use_action_tanh', False)
+                    
+                    # Try to use the new compatible wrapper first, fallback to old wrapper
+                    try:
+                        from verl.utils.vla_utils.openpi import CompatibleOpenPIWrapper, create_compatible_wrapper
+                        
+                        if COMPATIBLE_WRAPPER_AVAILABLE:
+                            actor_module = create_compatible_wrapper(
+                                model=openpi_model,
+                                action_dim=action_dim,
+                                action_horizon=action_horizon,
+                                action_std_init=action_std_init,
+                                learn_std=learn_std,
+                                use_tanh=use_tanh,
+                                model_type="wrapper"  # This is a wrapper-based model
+                            )
+                            if self.rank == 0:
+                                print("✓ Using compatible wrapper for PPO training")
+                        else:
+                            raise ImportError("Compatible wrapper not available")
+                    
+                    except (ImportError, Exception) as e:
+                        if self.rank == 0:
+                            print(f"Falling back to legacy PPO wrapper: {e}")
+                        
+                        from verl.utils.vla_utils.openpi import OpenPIPPOWrapper, create_openpi_ppo_wrapper
+                        
+                        actor_module = OpenPIPPOWrapper(
+                            openpi_model=openpi_model,
+                            action_dim=action_dim,
+                            action_horizon=action_horizon,
+                            action_std_init=action_std_init,
+                            learn_std=learn_std,
+                            use_tanh=use_tanh,
+                        )
+                    
+                    # Pass norm stats to wrapper for consistency
+                    if hasattr(openpi_model, 'norm_stats'):
+                        actor_module.norm_stats = openpi_model.norm_stats
+                    
+                    if self.rank == 0:
+                        print(f"✓ Using wrapper-based PPO training")
+                        print(f"  - Action dim: {action_dim}")
+                        print(f"  - Action horizon: {action_horizon}")
+                        print(f"  - Model type: {self.config.model.vla}")
+                        print(f"  - Action std init: {action_std_init}")
+                        print(f"  - Learn std: {learn_std}")
+                        print(f"  - Use tanh: {use_tanh}")
+                        print(f"  - Diffusion steps (inference): {openpi_model.num_inference_steps}")
+                        print(f"="*80)
+                
+                actor_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable()

@@ -199,7 +199,7 @@ class RobDataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
     
-    def _forward_micro_batch_update(self, input_ids, attention_mask, pixel_values, responses, temperature, proprio) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch_update(self, input_ids, attention_mask, pixel_values, responses, temperature, proprio, wrist_pixel_values=None, state=None) -> Tuple[torch.Tensor, torch.Tensor]:
        
         
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -253,6 +253,48 @@ class RobDataParallelPPOActor(BasePPOActor):
                 log_probs = log_probs.reshape((1, -1))
                 entropy = entropy.reshape((1, -1))
 
+                return entropy, log_probs
+            
+            elif self.config.vla in ["pi_0", "pi_05"]:
+                # OpenPI models use Gaussian policy for continuous action prediction
+                # The model returns action_means and action_stds through the wrapper
+                output = self.actor_module(
+                    pixel_values=pixel_values,
+                    wrist_pixel_values=wrist_pixel_values,
+                    state=state,
+                    task_descriptions=None,  # Will be filled by caller
+                    return_dict=True,
+                )
+                
+                # Extract Gaussian policy parameters from wrapper output
+                action_means = output["action_means"]  # [B, action_horizon, action_dim]
+                action_stds = output["action_stds"]    # [B, action_horizon, action_dim]
+                
+                # Reshape responses to match action format
+                batch_size = action_means.size(0)
+                action_horizon = action_means.size(1)
+                action_dim = action_means.size(2)
+                
+                # Flatten responses to [B, action_horizon * action_dim]
+                responses_flat = responses.reshape(batch_size, -1)
+                
+                # Compute correct Gaussian log probability
+                # log N(a | μ, σ²) = -0.5 * ((a-μ)²/σ² + log(2πσ²))
+                log_probs = -0.5 * (
+                    (responses_flat - action_means.view(batch_size, -1))**2 / (action_stds.view(batch_size, -1)**2 + 1e-8) +
+                    torch.log(2 * torch.pi * action_stds.view(batch_size, -1)**2 + 1e-8)
+                )
+                # Sum over action dimensions
+                log_probs = log_probs.sum(dim=-1)  # [B]
+                
+                # Compute correct Gaussian entropy
+                # H = 0.5 * d * (1 + log(2π)) + Σ log(σ_i)
+                entropy = 0.5 * action_dim * (1 + torch.log(2 * torch.pi)) + \
+                          torch.sum(torch.log(action_stds.view(batch_size, -1) + 1e-8), dim=-1)
+                
+                log_probs = log_probs.reshape((1, -1))
+                entropy = entropy.reshape((1, -1))
+                
                 return entropy, log_probs
                 
 
@@ -328,6 +370,38 @@ class RobDataParallelPPOActor(BasePPOActor):
                 entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                 #ADD
 
+                entropy = entropy.reshape((batch_size, traj_len,) + entropy.shape[1:])
+                mask = self.generate_traj_mask(micro_batch['finish_step'], traj_len)
+                _, entropy = self.apply_mask_with_grad_control(entropy, entropy, mask)
+                entropy = entropy.reshape((batch_size, traj_len*response_length))
+                return entropy
+            
+            elif self.config.vla in ["pi_0", "pi_05"]:
+                # OpenPI entropy computation - correct Gaussian entropy
+                wrist_pixel_values = micro_batch.get("wrist_pixel_values", None)
+                state_data = micro_batch.get("state", None)
+                
+                output = self.actor_module(
+                    pixel_values=pixel_values,
+                    wrist_pixel_values=wrist_pixel_values,
+                    state=state_data,
+                    task_descriptions=None,  # Will be filled by caller
+                    return_dict=True,
+                )
+                
+                # Extract Gaussian policy parameters
+                action_means = output["action_means"]  # [B, action_horizon, action_dim]
+                action_stds = output["action_stds"]    # [B, action_horizon, action_dim]
+                
+                # Compute correct Gaussian entropy
+                # H = 0.5 * d * (1 + log(2π)) + Σ log(σ_i)
+                action_dim = action_means.size(-1)
+                entropy = 0.5 * action_dim * (1 + torch.log(2 * torch.pi)) + \
+                          torch.sum(torch.log(action_stds + 1e-8), dim=-1)  # [B, action_horizon]
+                
+                # Expand to match response length
+                entropy = entropy.unsqueeze(-1).expand(-1, response_length // action_horizon)
+                
                 entropy = entropy.reshape((batch_size, traj_len,) + entropy.shape[1:])
                 mask = self.generate_traj_mask(micro_batch['finish_step'], traj_len)
                 _, entropy = self.apply_mask_with_grad_control(entropy, entropy, mask)
@@ -481,14 +555,29 @@ class RobDataParallelPPOActor(BasePPOActor):
                 traj_split_num = int(traj_len/self.config.traj_mini_batch_size)
                 
 
+                # Extract OpenPI-specific data if needed
+                wrist_pixel_values = None
+                state_data = None
+                if self.config.vla in ["pi_0", "pi_05"]:
+                    if "wrist_pixel_values" in data:
+                        wrist_pixel_values = data["wrist_pixel_values"]
+                        wrist_pixel_values = wrist_pixel_values.reshape((batch_size * traj_len,) + wrist_pixel_values.shape[2:])
+                    if "state" in data:
+                        state_data = data["state"]
+                        state_data = state_data.reshape((batch_size * traj_len,) + state_data.shape[2:])
+                
                 for i in range(0, traj_len, int(traj_len/traj_split_num)):
                    
-                    entropy, log_prob = self._forward_micro_batch_update(input_ids=input_ids[i:i+int(traj_len/traj_split_num)], 
-                                                                         attention_mask=attention_mask[i:i+int(traj_len/traj_split_num)], 
-                                                                         pixel_values=pixel_values[i:i+int(traj_len/traj_split_num)], 
-                                                                         responses=responses[i:i+int(traj_len/traj_split_num)], 
-                                                                         temperature=temperature,
-                                                                         proprio=proprio[i:i+int(traj_len/traj_split_num)] if proprio is not None  else None)
+                    entropy, log_prob = self._forward_micro_batch_update(
+                        input_ids=input_ids[i:i+int(traj_len/traj_split_num)], 
+                        attention_mask=attention_mask[i:i+int(traj_len/traj_split_num)], 
+                        pixel_values=pixel_values[i:i+int(traj_len/traj_split_num)], 
+                        responses=responses[i:i+int(traj_len/traj_split_num)], 
+                        temperature=temperature,
+                        proprio=proprio[i:i+int(traj_len/traj_split_num)] if proprio is not None else None,
+                        wrist_pixel_values=wrist_pixel_values[i:i+int(traj_len/traj_split_num)] if wrist_pixel_values is not None else None,
+                        state=state_data[i:i+int(traj_len/traj_split_num)] if state_data is not None else None
+                    )
                     
                     slice_id = i*self.config.action_token_len*self.config.action_chunks_len
                     next_slice_id = (i+int(traj_len/traj_split_num))*self.config.action_token_len*self.config.action_chunks_len

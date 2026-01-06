@@ -81,7 +81,14 @@ def get_fsdp_wrap_policy_vla(module, config=None, is_lora=False):
     #     )\
         
     #default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
-    default_transformer_cls_names_to_wrap = getattr(module.language_model, "_no_split_modules", None)
+    # Check if module has language_model attribute (for VLA models like OpenVLA)
+    # For OpenPI models, use the module's own _no_split_modules or create a default policy
+    if hasattr(module, 'language_model'):
+        default_transformer_cls_names_to_wrap = getattr(module.language_model, "_no_split_modules", None)
+    else:
+        # For OpenPI models without language_model, try to get from the module itself
+        # or use a simple transformer policy
+        default_transformer_cls_names_to_wrap = getattr(module, "_no_split_modules", None)
     
     fsdp_transformer_layer_cls_to_wrap = default_transformer_cls_names_to_wrap
 
@@ -102,6 +109,12 @@ def get_fsdp_wrap_policy_vla(module, config=None, is_lora=False):
             # Transformer layer class to wrap
             transformer_layer_cls=transformer_cls_to_wrap,
         )
+    else:
+        # For OpenPI models without specific transformer classes, use a simple module-based policy
+        # This will wrap the entire module as a single FSDP unit
+        print("No transformer classes found, using module-level FSDP wrapping")
+        llm_wrap_policy = functools.partial(_module_wrap_policy, module_classes={type(module)})
+    
     print("llm_wrap_policy:",llm_wrap_policy)
     assert llm_wrap_policy is not None
 

@@ -132,7 +132,9 @@ def main_task(config):
 
     # instantiate tokenizer
     from verl.utils import hf_tokenizer
-    tokenizer = hf_tokenizer(local_path)
+    # Pass model type to tokenizer for proper handling of different VLA models
+    vla_model_type = config.actor_rollout_ref.model.get('vla', None)
+    tokenizer = hf_tokenizer(local_path, model=vla_model_type)
 
     # define worker classes
     if config.actor_rollout_ref.actor.strategy == 'fsdp':
