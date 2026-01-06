@@ -6,7 +6,7 @@ export WANDB_API_KEY='3d22226520853a1a7965ae833ad941f1389ed619'
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=true
 export ROBOT_PLATFORM=LIBERO
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=4
 export MUJOCO_GL="egl"
 
 # OpenPI specific settings
@@ -25,7 +25,7 @@ SFT_MODEL_PATH="/data/zhengshenli/openpi_models/pi05_libero_pytorch"
 CKPT_PATH="/data/zhengshenli/openvla_rl"
 DATASET_NAME="libero_10"  # libero_10, libero_90, libero_spatial, libero_object, libero_goal
 VLA_NAME="pi_05"  # pi_0 or pi_05
-NUM_GPUS=4
+NUM_GPUS=1
 NUM_NODES=1
 ALIGN_PATH="/data/zhengshenli/leo/embodied_ai/SimpleVLA-RL_openpi/align.json"
 

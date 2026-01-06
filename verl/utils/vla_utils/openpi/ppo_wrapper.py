@@ -73,6 +73,11 @@ class OpenPIPPOWrapper(nn.Module):
         # Track training mode
         self._is_training = True
         
+        # Store reference to action tokenizer if available (for PI0RLWrapper)
+        self.action_tokenizer = None
+        if hasattr(openpi_model, 'action_tokenizer'):
+            self.action_tokenizer = openpi_model.action_tokenizer
+        
     @property
     def std(self) -> torch.Tensor:
         """Get current standard deviation with clipping"""
@@ -137,48 +142,64 @@ class OpenPIPPOWrapper(nn.Module):
                 action_hidden = hidden_states[-1]  # Take suffix output
             else:
                 action_hidden = hidden_states
+        elif isinstance(output, dict):
+            # Model returns a dictionary (e.g., from PI0RLWrapper)
+            action_hidden = output
         else:
-            # Assume dict-like output
+            # Assume direct tensor output
             action_hidden = output
         
         # Extract or create action logits
-        if hasattr(action_hidden, 'logits'):
+        if isinstance(action_hidden, dict):
+            # Dictionary output - extract appropriate keys
+            if 'logits' in action_hidden:
+                action_logits = action_hidden['logits']
+                # Check if these are token logits from PI0RLWrapper (3D: B, H*D, num_bins)
+                if len(action_logits.shape) == 3 and self.action_tokenizer is not None:
+                    # Convert token logits to continuous actions using soft detokenization
+                    continuous_actions = self.action_tokenizer.soft_detokenize(action_logits)
+                    # Reshape to [B, action_horizon, action_dim]
+                    action_means = continuous_actions.view(batch_size, self.action_horizon, self.action_dim)
+                else:
+                    # These are already continuous action logits
+                    action_means = action_logits.view(batch_size, self.action_horizon, self.action_dim)
+            elif 'continuous_actions' in action_hidden:
+                action_means = action_hidden['continuous_actions']
+                # Ensure correct shape
+                if action_means.shape != (batch_size, self.action_horizon, self.action_dim):
+                    action_means = action_means.view(batch_size, self.action_horizon, self.action_dim)
+            elif 'action_means' in action_hidden:
+                action_means = action_hidden['action_means']
+            else:
+                raise ValueError(f"Dictionary output doesn't contain expected keys. Keys: {list(action_hidden.keys())}")
+        elif hasattr(action_hidden, 'logits'):
             action_logits = action_hidden.logits
+            # Check if these are token logits from PI0RLWrapper (3D: B, H*D, num_bins)
+            if len(action_logits.shape) == 3 and self.action_tokenizer is not None:
+                # Convert token logits to continuous actions using soft detokenization
+                continuous_actions = self.action_tokenizer.soft_detokenize(action_logits)
+                # Reshape to [B, action_horizon, action_dim]
+                action_means = continuous_actions.view(batch_size, self.action_horizon, self.action_dim)
+            else:
+                # These are already continuous action logits
+                action_means = action_logits.view(batch_size, self.action_horizon, self.action_dim)
         elif hasattr(action_hidden, 'last_hidden_state'):
             # Project hidden state to action space
             action_logits = action_hidden.last_hidden_state
+            action_means = action_logits.view(batch_size, self.action_horizon, self.action_dim)
         else:
             # Assume hidden_state IS the action representation
-            action_logits = action_hidden
-        
-        # Ensure correct shape: [B, action_horizon * action_dim]
-        batch_size = action_logits.size(0)
-        expected_output_dim = self.action_horizon * self.action_dim
-        
-        if action_logits.size(-1) != expected_output_dim:
-            # Reshape if needed
-            action_logits = action_logits.view(batch_size, -1)
-            if action_logits.size(-1) > expected_output_dim:
-                action_logits = action_logits[:, :expected_output_dim]
-            elif action_logits.size(-1) < expected_output_dim:
-                # Pad if necessary
-                padding = torch.zeros(
-                    batch_size, 
-                    expected_output_dim - action_logits.size(-1),
-                    device=action_logits.device,
-                    dtype=action_logits.dtype
-                )
-                action_logits = torch.cat([action_logits, padding], dim=-1)
-        
-        # Reshape to [B, action_horizon, action_dim]
-        action_means = action_logits.view(batch_size, self.action_horizon, self.action_dim)
+            action_means = action_hidden.view(batch_size, self.action_horizon, self.action_dim)
         
         # Get std (broadcast across horizon)
         action_stds = self.std.unsqueeze(0).unsqueeze(0).expand_as(action_means)
         
+        # Flatten logits for SimpleVLA compatibility
+        logits = action_means.reshape(batch_size, -1)  # [B, action_horizon * action_dim]
+        
         # Prepare output dict
         result = {
-            'logits': action_logits,  # [B, action_horizon * action_dim]
+            'logits': logits,  # [B, action_horizon * action_dim]
             'action_means': action_means,  # [B, action_horizon, action_dim]
             'action_stds': action_stds,  # [B, action_horizon, action_dim]
         }
@@ -188,6 +209,8 @@ class OpenPIPPOWrapper(nn.Module):
             result['hidden_states'] = action_hidden.hidden_states
         elif isinstance(action_hidden, list):
             result['hidden_states'] = action_hidden
+        elif isinstance(action_hidden, dict) and 'hidden_states' in action_hidden:
+            result['hidden_states'] = action_hidden['hidden_states']
         
         return result
     
@@ -241,7 +264,7 @@ class OpenPIPPOWrapper(nn.Module):
         
         Args:
             means: Predicted action means [B, action_horizon, action_dim]
-            stds: Standard deviations [B, action_horizon, action_dim]
+            stds: Predicted stds [B, action_horizon, action_dim]
             deterministic: If True, return means without sampling
         
         Returns:
