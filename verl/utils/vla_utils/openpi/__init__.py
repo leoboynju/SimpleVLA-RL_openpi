@@ -55,6 +55,18 @@ except ImportError as e:
     OpenPIPPOWrapper = None
     create_openpi_ppo_wrapper = None
 
+# OpenPI policy wrapper for direct model access (no complex inference pipeline)
+# Uses raw PyTorch models for RL training
+try:
+    from .openpi_policy_wrapper import OpenPIPolicyWrapper, create_openpi_policy_model
+    OPENPI_POLICY_AVAILABLE = True
+    print("✓ OpenPI policy wrapper available (direct model access for RL)")
+except ImportError as e:
+    OPENPI_POLICY_AVAILABLE = False
+    print(f"Warning: OpenPI policy wrapper not available: {e}")
+    OpenPIPolicyWrapper = None
+    create_openpi_policy_model = None
+
 # Universal wrapper for OpenPI models (auto-detects model type)
 # Provides compatibility with both direct and wrapper-based models
 try:
@@ -80,6 +92,9 @@ __all__ = [
     'OpenPIPPOWrapper',
     'create_openpi_ppo_wrapper',
     'PPO_WRAPPER_AVAILABLE',
+    'OpenPIPolicyWrapper',
+    'create_openpi_policy_model',
+    'OPENPI_POLICY_AVAILABLE',
     'CompatibleOpenPIWrapper',
     'create_compatible_wrapper',
     'COMPATIBLE_WRAPPER_AVAILABLE',
